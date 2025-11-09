@@ -11,6 +11,9 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.Optional;
 import java.util.Random;
 
@@ -26,11 +29,37 @@ public class UrlShortenerController {
         this.urlMappingRepository = urlMappingRepository;
     }
 
+    /**
+     * Creates a short URL for a given long URL. This method is idempotent.
+     * <p>
+     * It uses a SHA-256 hash of the long URL to ensure that the same long URL always maps to the same short URL.
+     * <p>
+     * NOTE: In the extremely rare case of a hash collision where two different long URLs produce the same hash,
+     * only the first URL to be processed will be stored.
+     *
+     * @param longUrl The long URL to shorten.
+     * @return The shortened URL.
+     */
     @PostMapping("/shorten")
     public String shortenUrl(@RequestBody String longUrl) {
         LOGGER.info("Received request to shorten URL: {}", longUrl);
+        String longUrlHash = generateHash(longUrl);
+        Optional<UrlMapping> existingMapping = urlMappingRepository.findByLongUrlHash(longUrlHash);
+        if (existingMapping.isPresent() && existingMapping.get().getLongUrl().equals(longUrl)) {
+            String fullShortUrl = baseUrl + existingMapping.get().getShortUrl();
+            LOGGER.info("Returning existing short URL: {}", fullShortUrl);
+            return fullShortUrl;
+        }
+
         String shortUrl = generateShortUrl();
-        urlMappingRepository.save(new UrlMapping(shortUrl, longUrl));
+        // The save operation can throw a DataIntegrityViolationException.
+        // This can happen in two cases:
+        // 1. A race condition where two requests for the same new URL arrive simultaneously.
+        // 2. A hash collision where a new URL has the same hash as an existing, different URL.
+        // In either case, we let the exception propagate, resulting in an error response.
+        // The client can then retry the request. On retry, case (1) will succeed by finding the existing URL.
+        // Case (2) is an accepted limitation of this implementation.
+        urlMappingRepository.save(new UrlMapping(shortUrl, longUrl, longUrlHash));
         String fullShortUrl = baseUrl + shortUrl;
         LOGGER.info("Shortened URL created: {}", fullShortUrl);
         return fullShortUrl;
@@ -57,6 +86,26 @@ public class UrlShortenerController {
         for (int i = 0; i < 6; i++) {
             sb.append(chars.charAt(random.nextInt(chars.length())));
         }
+        // In a real-world scenario, we'd also need to check for collisions on the short URL
         return sb.toString();
+    }
+
+    private String generateHash(String text) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(text.getBytes(StandardCharsets.UTF_8));
+            StringBuilder hexString = new StringBuilder();
+            for (byte b : hash) {
+                String hex = Integer.toHexString(0xff & b);
+                if (hex.length() == 1) {
+                    hexString.append('0');
+                }
+                hexString.append(hex);
+            }
+            return hexString.toString();
+        } catch (NoSuchAlgorithmException e) {
+            // This should never happen with a standard algorithm like SHA-256
+            throw new RuntimeException("Could not generate hash", e);
+        }
     }
 }
